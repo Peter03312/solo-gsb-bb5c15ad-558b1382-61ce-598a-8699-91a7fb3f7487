@@ -1,4 +1,4 @@
-"""FastAPI 入口：JSON Schema 反例最小化 + 确定性变异生成服务。"""
+"""FastAPI 入口：JSON Schema 反例最小化 + 确定性变异生成 + 导入预览修复服务。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from jsonschema.exceptions import SchemaError
 
 from .minimizer import Minimizer, build_validator, pointer_from_path
 from .mutator import Mutator
+from .repairer import RepairSearcher
 from .differ import (
     DiffMinimizer,
     UnusableSchemaError,
@@ -30,9 +31,10 @@ app = FastAPI(
         "锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；"
         "也可以给定合法样例，确定性生成覆盖各类约束关键字的最小变异实例；"
         "还可以对比新旧两版 schema 对同一实例的通过/拒绝差异，并确定性缩减"
-        "出更小的差异见证。"
+        "出更小的差异见证；面向数据导入预览，还能在有界预算内为 required"
+        "（带 default）/ enum / const / 数值与长度边界等错误搜索最小修复候选。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -300,3 +302,66 @@ def schema_diff(req: SchemaDiffRequest) -> JSONResponse:
         }
     )
     return JSONResponse(status_code=200, content=content)
+
+
+class ImportPreviewRequest(BaseModel):
+    # JSON Schema 本身可以是 object 或 boolean（true/false schema）。
+    schema_: Annotated[
+        Any,
+        Field(
+            alias="schema",
+            title="JSON Schema",
+            description="待针对校验的 JSON Schema，支持 draft 3/4/6/7/2019-09/2020-12。",
+        ),
+    ]
+    instance: Any = Field(
+        ...,
+        title="待导入实例",
+        description="待导入预览、可能未通过校验的 JSON 实例。",
+    )
+    max_evaluations: int | None = Field(
+        default=None,
+        ge=1,
+        le=HARD_MAX_EVALUATIONS,
+        description=(
+            "最大校验评估次数（含对原实例的首次校验；每个候选重新全量校验）；"
+            f"默认 {DEFAULT_MAX_EVALUATIONS}，硬上限 {HARD_MAX_EVALUATIONS}。"
+        ),
+    )
+
+
+@app.post("/import-preview")
+def import_preview(req: ImportPreviewRequest) -> JSONResponse:
+    max_evaluations = (
+        req.max_evaluations
+        if req.max_evaluations is not None
+        else DEFAULT_MAX_EVALUATIONS
+    )
+
+    # schema 自身不合法：返回 422。
+    try:
+        validator = build_validator(req.schema_)
+    except SchemaError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_schema",
+                "message": exc.message,
+                "path": list(exc.absolute_path),
+            },
+        )
+
+    searcher = RepairSearcher(validator, req.instance, max_evaluations)
+    try:
+        result = searcher.run()
+    except Exception as exc:
+        # check_schema 通过但校验器无法实际运行（坏 $ref、非法正则等）：不可用 schema。
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_schema",
+                "message": f"schema 无法用于校验: {exc}",
+                "path": [],
+            },
+        )
+    return JSONResponse(status_code=200, content=result.to_dict())
