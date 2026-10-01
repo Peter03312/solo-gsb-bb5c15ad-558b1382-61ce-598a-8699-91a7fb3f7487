@@ -1,6 +1,6 @@
 # JSON Schema 反例最小化 API
 
-基于 **Python + FastAPI** 的确定性反例（counterexample）工具服务，提供三个接口：
+基于 **Python + FastAPI** 的确定性 JSON Schema 工具服务，提供四个接口：
 
 - **`POST /minimize`**：给定 JSON Schema 和一个**未通过校验**的实例，做确定性
   delta debugging 最小化，锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；
@@ -9,7 +9,12 @@
   **最小变异实例**，每个变异携带 JSON Pointer、预期触发关键字与可复现 seed；
 - **`POST /schema-diff`**：给定**旧版、新版**两个 JSON Schema 与一个 JSON 实例，
   返回两版各自的通过/拒绝状态与首个错误；结果相反时沿用 `/minimize` 的确定性
-  缩减步骤找出更小的**差异见证**（每个候选都必须保持两版通过/拒绝组合）。
+  缩减步骤找出更小的**差异见证**（每个候选都必须保持两版通过/拒绝组合）；
+- **`POST /repair`**：面向**数据导入预览**，给定 JSON Schema、待导入实例和
+  **校验次数上限**，在有界预算内搜索单点改动，返回修复状态、候选实例、按
+  JSON Pointer 标识的变更以及候选的剩余错误。仅对 `required`（缺失属性带
+  `default` 时）、`enum`/`const`、`minimum`/`maximum`、
+  `minLength`/`maxLength` 构造改动，其他约束仍参与完整校验，**不凭空补必填值**。
 
 `/minimize` 的工作流程：
 
@@ -46,6 +51,28 @@
    通过/拒绝发生翻转（包括两边都拒绝/都通过）即丢弃候选；
 4. 返回最小差异见证、差异方向（`new_rejects` / `new_accepts`）、双版评估
    次数与预算中止标记。
+
+`/repair` 的工作流程：
+
+1. 先对待导入实例做一次完整校验（计入预算）：已经合法时 **不作任何修改**，
+   直接返回 `valid`；
+2. 仅为以下关键字构造 **单点改动**（其余约束照常参与每个候选的完整校验）：
+   - `required`：缺失属性在其声明子 schema（经 `$ref` / `allOf` 展开）中
+     带 `default` 时补入默认值；**没有 `default` 的缺失属性不构造任何改动**
+     （不凭空补必填值）；
+   - `enum` / `const`：替换为取值集合内的成员，enum 按“同类型首个 + 任意
+     首个”至多取两个确定性候选；
+   - `minimum` / `maximum`：夹紧到边界值本身（整型值遇到非整数边界时取
+     仍满足约束的最近整数 `ceil`/`floor`）；
+   - `minLength` / `maxLength`：重复末字符（空串补 `x`）填充到下界，或截断
+     到上界；
+3. 多处错误按 **改动位置数分层做有界最佳优先搜索**：第 k 层候选恰好触及 k 个
+   JSON Pointer 位置；每个候选都 **重新执行一次全量校验**，仅全部通过才标记
+   `repaired`；候选实例按规范 JSON 序列化去重；
+4. 择优顺序固定为 **剩余错误数 → 改动位置数 → 固定生成顺序**；预算耗尽或
+   不存在可行改动时，保留搜索过程中见到的 **最佳候选** 并明确标记
+   `unrepaired`（`reason` 区分 `budget_exhausted` / `no_applicable_edits` /
+   `unrepairable`）。
 
 整个过程不使用任何随机源，相同输入必然得到相同结果（依赖版本已锁定）。
 
@@ -275,6 +302,79 @@ docker compose up --build -d   # 然后访问 http://localhost:9000
 
 ---
 
+### `POST /repair`
+
+面向数据导入预览：给定 JSON Schema、待导入实例和**校验次数上限**，在有界
+预算内尝试用单点改动把实例修到通过校验，返回修复状态、候选实例、按 JSON
+Pointer 标识的变更和候选的剩余错误。
+
+请求体：
+
+| 字段              | 类型             | 必填 | 说明                                                                 |
+| ----------------- | ---------------- | ---- | -------------------------------------------------------------------- |
+| `schema`          | object / boolean | 是   | JSON Schema（支持 Draft 3/4/6/7/2019-09/2020-12，含布尔 schema）    |
+| `instance`        | 任意 JSON        | 是   | 待导入的 JSON 实例；已经合法时不会被修改                             |
+| `max_evaluations` | integer          | 否   | 校验次数上限（**含对原实例的首次校验**），默认/上限见配置表，≥ 1     |
+
+一次“评估”指对一个候选实例执行一次**完整 JSON 校验**。
+
+#### 可自动修复的约束
+
+| 关键字                   | 单点改动                                                     |
+| ------------------------ | ------------------------------------------------------------ |
+| `required`               | 仅当缺失属性在声明子 schema（经本地 `$ref` / `allOf` 展开）中带 `default` 时补入该默认值；无 `default` 不补 |
+| `enum` / `const`         | 替换为取值集合内的确定性成员（enum 至多两个候选：同类型首个 + 任意首个） |
+| `minimum` / `maximum`    | 夹紧到边界值；整型值遇到非整数边界取 `ceil`/`floor` 最近整数 |
+| `minLength` / `maxLength`| 重复末字符填充到下界（空串补 `x`）；截断到上界               |
+
+其他关键字（`type` / `pattern` / `multipleOf` / `exclusiveMinimum` /
+`minItems` / `minProperties` 等）**不构造改动**，但仍参与每个候选的完整
+校验并计入 `remaining_errors`。
+
+#### 响应 `200`
+
+| 字段                     | 说明                                                                       |
+| ------------------------ | -------------------------------------------------------------------------- |
+| `status`                 | `valid`（原实例已合法，未修改）/ `repaired`（候选全部通过）/ `unrepaired`（未修复，保留最佳候选） |
+| `reason`                 | 仅 `unrepaired` 时非空：`budget_exhausted` / `no_applicable_edits` / `unrepairable` |
+| `candidate_instance`     | 最佳候选实例（原实例合法或未修复时可能与 `original_instance` 相同）        |
+| `original_instance`      | 原始实例（原样回显）                                                       |
+| `original_valid`         | 原实例是否已通过校验                                                       |
+| `remaining_error_count`  | 候选实例的剩余错误数（去重后；`repaired`/`valid` 时为 `0`）                |
+| `remaining_errors[]`     | 候选的剩余错误：`keyword` / `pointer` / `message`                          |
+| `changes[]`              | 最佳候选相对原实例的变更（同一位置的多次编辑折叠为最终一次，见下）         |
+| `changed_location_count` | 变更触及的不同 JSON Pointer 位置数                                         |
+| `evaluations`            | 实际消耗的校验次数                                                         |
+| `stopped_by_budget`      | `true` 表示因校验次数预算提前中止                                          |
+
+`changes[]` 条目字段：
+
+| 字段      | 说明                                                                       |
+| --------- | -------------------------------------------------------------------------- |
+| `pointer` | 变更位置的 JSON Pointer（根为 `""`；新增属性指向该属性，如 `/id`）         |
+| `keyword` | 触发该步改动的关键字：`required` / `enum` / `const` / `minimum` / `maximum` / `minLength` / `maxLength` |
+| `action`  | 改动动作：`add-default` / `set-enum` / `set-const` / `raise-to-minimum` / `lower-to-maximum` / `pad-to-min-length` / `truncate-to-max-length` |
+| `added`   | 是否为新增属性（`required` 补默认值时为 `true`）                           |
+| `from`    | 该位置在原实例中的值；原实例不存在该位置时为 `null`（结合 `added` 判断）   |
+| `to`      | 该位置在候选实例中的最终值                                                 |
+| `detail`  | 人类可读的改动描述                                                         |
+
+搜索按 **改动位置数分层 BFS**：每个候选都重新全量校验，全部通过才成功；
+候选按规范 JSON 去重，按剩余错误数、改动位置数与固定生成顺序择优。补入的
+默认值本身也会被完整校验（例如默认值违反 `type` 时不会被当作成功）。
+
+#### 错误响应（均为 `422`）
+
+- schema 自身不合法或无法用于校验（如坏 `$ref`、非法正则）：
+
+  ```json
+  { "error": "invalid_schema", "message": "...", "path": [] }
+  ```
+
+- 请求体缺少必填字段、`max_evaluations` 越界等：FastAPI/Pydantic 标准 422 结构。
+
+---
+
 ## 使用示例
 
 ```bash
@@ -434,6 +534,99 @@ print(data["old"]["status"], data["new"]["status"])  # reject pass
 print(data["direction"], data["minimal_instance"])    # new_accepts None
 ```
 
+### `/repair` 示例
+
+一次导入预览：`id` 低于下界、`name` 过长、`role` 不在枚举里，`note` 是缺失
+但带 `default` 的必填属性——每处错误各一个单点改动，候选全部通过：
+
+```bash
+curl -s -X POST http://localhost:8000/repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "schema": {
+      "type": "object",
+      "required": ["id", "name", "role", "note"],
+      "properties": {
+        "id":   {"type": "integer", "minimum": 1, "maximum": 100},
+        "name": {"type": "string", "minLength": 3, "maxLength": 10},
+        "role": {"enum": ["admin", "user"]},
+        "note": {"type": "string", "default": ""}
+      }
+    },
+    "instance": {"id": -5, "name": "this-name-is-way-too-long", "role": "root"},
+    "max_evaluations": 100
+  }'
+```
+
+响应（节选；同一实例的候选按规范 JSON 去重，变更顺序固定为 BFS 生成顺序）：
+
+```json
+{
+  "status": "repaired",
+  "reason": null,
+  "candidate_instance": {"id": 1, "name": "this-name-", "role": "admin", "note": ""},
+  "remaining_error_count": 0,
+  "changes": [
+    {"pointer": "/note", "keyword": "required",  "action": "add-default",           "added": true,  "from": null, "to": ""},
+    {"pointer": "/id",   "keyword": "minimum",   "action": "raise-to-minimum",       "added": false, "from": -5, "to": 1},
+    {"pointer": "/name", "keyword": "maxLength", "action": "truncate-to-max-length", "added": false, "from": "this-name-is-way-too-long", "to": "this-name-"},
+    {"pointer": "/role", "keyword": "enum",      "action": "set-enum",              "added": false, "from": "root", "to": "admin"}
+  ],
+  "changed_location_count": 4,
+  "evaluations": 24,
+  "stopped_by_budget": false
+}
+```
+
+缺失的必填属性 **没有** `default` 时不会凭空造值：状态为 `unrepaired`，
+`reason` 为 `no_applicable_edits`，候选保持原实例，剩余错误照常列出：
+
+```bash
+curl -s -X POST http://localhost:8000/repair \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "schema": {"type":"object","required":["id"],"properties":{"id":{"type":"integer"}}},
+    "instance": {"name": "Ada"}
+  }'
+```
+
+```json
+{
+  "status": "unrepaired",
+  "reason": "no_applicable_edits",
+  "candidate_instance": {"name": "Ada"},
+  "remaining_error_count": 1,
+  "remaining_errors": [
+    {"keyword": "required", "pointer": "", "message": "'id' is a required property"}
+  ],
+  "changes": [],
+  "changed_location_count": 0
+}
+```
+
+预算极小时提前中止，保留已评估出的**最佳候选**（剩余错误最少、改动位置
+最少）并明确标记未修复：把上例 `max_evaluations` 设为 1 时只会校验原实例，
+`reason` 为 `budget_exhausted`、`stopped_by_budget` 为 `true`。
+
+Python 调用：
+
+```python
+import httpx
+
+r = httpx.post(
+    "http://localhost:8000/repair",
+    json={
+        "schema": {"type": "string", "minLength": 3, "maxLength": 8},
+        "instance": "a-way-too-long-import-value",
+        "max_evaluations": 50,
+    },
+)
+data = r.json()
+print(data["status"])                 # repaired
+print(data["candidate_instance"])     # 'a-way-to'
+print(data["changes"][0]["action"])   # truncate-to-max-length
+```
+
 ---
 
 ## 算法说明（确定性保证）
@@ -452,6 +645,15 @@ print(data["direction"], data["minimal_instance"])    # new_accepts None
    做旧版、新版两次校验，合计为 1 次双版评估）。开始第
    `max_evaluations + 1` 次评估前立即停止并把 `stopped_by_budget` 置为 `true`，
    已接受的缩减全部保留。
+5. **`/repair` 有界搜索**：单点改动只针对 `required`（带 `default`）、
+   `enum`/`const`、`minimum`/`maximum`、`minLength`/`maxLength` 七类
+   关键字构造；搜索按 **改动位置数分层**（BFS，堆键为
+   `(位置数, 剩余错误数, 固定生成序号)`），因此首个全部通过的候选必然是
+   改动位置最少、固定顺序最前的解。每个候选独立做一次全量校验，候选实例
+   按规范 JSON 序列化全局去重；同一位置的多步编辑（如先补默认值、再夹紧
+   边界）只计一个改动位置。预算随时可能截断，因此每评估一个候选就即时
+   更新“最佳候选”（剩余错误数 → 位置数 → 固定序号），截断时连同剩余错误
+   与变更一并返回并标记 `unrepaired`。
 
 注意：这里的"最小"是 **1-最小（1-minimal）** 意义上的最小——算法保证在其
 操作算子下再删任何一个单元都会丢失目标关键字，但不保证是全局基数最小。
@@ -484,11 +686,13 @@ python -m pytest -q
 │   ├── main.py             # FastAPI 应用、请求/响应模型、配置
 │   ├── minimizer.py        # 确定性 delta debugging 最小化内核
 │   ├── differ.py           # 两版 schema 差异见证最小化（/schema-diff，复用 minimizer）
-│   └── mutator.py          # 确定性约束变异生成器（/mutations）
+│   ├── mutator.py          # 确定性约束变异生成器（/mutations）
+│   └── repairer.py         # 数据导入预览有界自动修复（/repair）
 ├── tests/
 │   ├── test_api.py         # /minimize 单元与端到端测试
 │   ├── test_schema_diff.py # /schema-diff 单元与端到端测试
-│   └── test_mutations.py   # /mutations 单元与端到端测试
+│   ├── test_mutations.py   # /mutations 单元与端到端测试
+│   └── test_repair.py      # /repair 单元与端到端测试
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .dockerignore

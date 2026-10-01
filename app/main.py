@@ -1,4 +1,4 @@
-"""FastAPI 入口：JSON Schema 反例最小化 + 确定性变异生成服务。"""
+"""FastAPI 入口：JSON Schema 反例最小化 + 确定性变异生成 + 导入预览修复服务。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from jsonschema.exceptions import SchemaError
 
 from .minimizer import Minimizer, build_validator, pointer_from_path
 from .mutator import Mutator
+from .repairer import Repairer
 from .differ import (
     DiffMinimizer,
     UnusableSchemaError,
@@ -30,9 +31,10 @@ app = FastAPI(
         "锁定首个校验错误的关键字，只保留仍触发同一关键字的候选；"
         "也可以给定合法样例，确定性生成覆盖各类约束关键字的最小变异实例；"
         "还可以对比新旧两版 schema 对同一实例的通过/拒绝差异，并确定性缩减"
-        "出更小的差异见证。"
+        "出更小的差异见证；或面向数据导入预览，在有界预算内搜索单点改动，"
+        "自动修复待导入实例（POST /repair）。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -300,3 +302,77 @@ def schema_diff(req: SchemaDiffRequest) -> JSONResponse:
         }
     )
     return JSONResponse(status_code=200, content=content)
+
+
+class RepairRequest(BaseModel):
+    # JSON Schema 本身可以是 object 或 boolean（true/false schema）。
+    schema_: Annotated[
+        Any,
+        Field(
+            alias="schema",
+            title="JSON Schema",
+            description="待针对校验的 JSON Schema，支持 draft 3/4/6/7/2019-09/2020-12。",
+        ),
+    ]
+    instance: Any = Field(
+        ...,
+        title="待导入的 JSON 实例",
+        description="数据导入预览的待修复实例；已经合法时不会被修改。",
+    )
+    max_evaluations: int | None = Field(
+        default=None,
+        ge=1,
+        le=HARD_MAX_EVALUATIONS,
+        description=(
+            "校验次数上限（含对原实例的首次校验）；"
+            f"默认 {DEFAULT_MAX_EVALUATIONS}，硬上限 {HARD_MAX_EVALUATIONS}。"
+        ),
+    )
+
+
+@app.post("/repair")
+def repair(req: RepairRequest) -> JSONResponse:
+    """面向数据导入预览的有界自动修复。
+
+    仅为 required（缺失属性带 default 时补默认值）、enum/const、
+    minimum/maximum、minLength/maxLength 构造单点改动；候选按
+    (剩余错误数, 改动位置数, 固定顺序) 择优，每个候选重新全量校验，
+    仅全部通过才标记 repaired；预算耗尽或无可行改动时保留最佳候选并标记
+    unrepaired。
+    """
+    max_evaluations = (
+        req.max_evaluations
+        if req.max_evaluations is not None
+        else DEFAULT_MAX_EVALUATIONS
+    )
+
+    # schema 自身不合法：返回 422。
+    try:
+        validator = build_validator(req.schema_)
+    except SchemaError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_schema",
+                "message": exc.message,
+                "path": list(exc.absolute_path),
+            },
+        )
+
+    repairer = Repairer(req.schema_, validator, req.instance, max_evaluations)
+
+    # 第 1 次评估（原实例）就可能暴露不可用 schema（坏 $ref、非法正则等）：
+    # 单独执行首次校验，便于把这类问题转成 422；repair() 复用该结果。
+    try:
+        initial = repairer.validate(req.instance)
+    except Exception as exc:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "invalid_schema",
+                "message": f"schema 无法用于校验: {exc}",
+                "path": [],
+            },
+        )
+    result = repairer.repair(initial=initial)
+    return JSONResponse(status_code=200, content=result.to_dict())
